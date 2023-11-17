@@ -230,12 +230,16 @@ def highlight_text(text: str) -> str:
     return "".join(ansiSplit)
 
 
-def gef_print(*args: str, end="\n", sep=" ", **kwargs: Any) -> None:
+def gef_print(*args: str, end="\n", sep=" ", buffer_name="default", **kwargs: Any) -> None:
     """Wrapper around print(), using string buffering feature."""
     parts = [highlight_text(a) for a in args]
-    if buffer_output() and gef.ui.stream_buffer and not is_debug():
-        gef.ui.stream_buffer.write(sep.join(parts) + end)
-        return
+    if buffer_output() and not is_debug():
+        if buffer_name == "default" and gef.ui.stream_buffer:
+            gef.ui.stream_buffer.write(sep.join(parts) + end)
+            return
+        elif buffer_name == "regs_buffer" and gef.ui.regs_stream_buffer:
+            gef.ui.regs_stream_buffer.write(sep.join(parts) + end)
+            return
 
     print(*parts, sep=sep, end=end, **kwargs)
     return
@@ -248,10 +252,11 @@ def bufferize(f: Callable) -> Callable:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         global gef
 
-        if gef.ui.stream_buffer:
+        if gef.ui.stream_buffer or gef.ui.regs_stream_buffer:
             return f(*args, **kwargs)
 
         gef.ui.stream_buffer = StringIO()
+        gef.ui.regs_stream_buffer = StringIO()
         try:
             rv = f(*args, **kwargs)
         finally:
@@ -282,6 +287,35 @@ def bufferize(f: Callable) -> Callable:
             fd.write(gef.ui.stream_buffer.getvalue())
             fd.flush()
             gef.ui.stream_buffer = None
+
+            regs_redirect = gef.config["context.regs_redirect"]
+            if regs_redirect.startswith("/dev/pts/"):
+                if not gef.ui.regs_redirect_fd:
+                    # if the FD has never been open, open it
+                    fd = open(regs_redirect, "wt")
+                    gef.ui.regs_redirect_fd = fd
+                elif regs_redirect != gef.ui.regs_redirect_fd.name:
+                    # if the user has changed the redirect setting during runtime, update the state
+                    gef.ui.regs_redirect_fd.close()
+                    fd = open(regs_redirect, "wt")
+                    gef.ui.regs_redirect_fd = fd
+                else:
+                    # otherwise, keep using it
+                    fd = gef.ui.regs_redirect_fd
+            else:
+                fd = sys.stdout
+                gef.ui.regs_redirect_fd = None
+
+            if gef.ui.regs_redirect_fd and fd.closed:
+                # if the tty was closed, revert back to stdout
+                fd = sys.stdout
+                gef.ui.regs_redirect_fd = None
+                gef.config["context.regs_redirect"] = ""
+
+            fd.write(gef.ui.regs_stream_buffer.getvalue())
+            fd.flush()
+            gef.ui.regs_stream_buffer = None
+
         return rv
 
     return wrapper
@@ -3738,6 +3772,8 @@ def clear_screen(tty: str = "") -> None:
     except PermissionError:
         gef.ui.redirect_fd = None
         gef.config["context.redirect"] = ""
+        gef.ui.regs_redirect_fd = None
+        gef.config["context.regs_redirect"] = ""
     return
 
 
@@ -7238,6 +7274,7 @@ class ContextCommand(GenericCommand):
         self["redirect"] = ("", "Redirect the context information to another TTY")
         self["libc_args"] = (False, "[DEPRECATED - Unused] Show libc function call args description")
         self["libc_args_path"] = ("", "[DEPRECATED - Unused] Path to libc function call args json files, provided via gef-extras")
+        self["regs_redirect"] = ("", "Redirect the regs information to another TTY")
 
         self.layout_mapping = {
             "legend": (self.show_legend, None, None),
@@ -7322,12 +7359,13 @@ class ContextCommand(GenericCommand):
 
         if self["clear_screen"] and len(argv) == 0:
             clear_screen(redirect)
+            clear_screen(self["regs_redirect"])
 
         if redirect and os.access(redirect, os.W_OK):
             disable_redirect_output()
         return
 
-    def context_title(self, m: Optional[str]) -> None:
+    def context_title(self, m: Optional[str], buffer_name="default") -> None:
         # allow for not displaying a title line
         if m is None:
             return
@@ -7337,7 +7375,7 @@ class ContextCommand(GenericCommand):
 
         # print an empty line in case of ""
         if not m:
-            gef_print(Color.colorify(HORIZONTAL_LINE * self.tty_columns, line_color))
+            gef_print(Color.colorify(HORIZONTAL_LINE * self.tty_columns, line_color), buffer_name=buffer_name)
             return
 
         trail_len = len(m) + 6
@@ -7349,11 +7387,11 @@ class ContextCommand(GenericCommand):
         title += Color.colorify(m, msg_color)
         title += Color.colorify(" {:{padd}<4}".format("", padd=HORIZONTAL_LINE),
                                 line_color)
-        gef_print(title)
+        gef_print(title, buffer_name=buffer_name)
         return
 
     def context_regs(self) -> None:
-        self.context_title("registers")
+        self.context_title("registers", buffer_name="regs_buffer")
         ignored_registers = set(self["ignore_registers"].split())
 
         # Defer to DetailRegisters by default
@@ -7413,14 +7451,14 @@ class ContextCommand(GenericCommand):
                     line += f"{format_address_spaces(value)} "
 
             if i % nb == 0:
-                gef_print(line)
+                gef_print(line, buffer_name="regs_buffer")
                 line = ""
             i += 1
 
         if line:
-            gef_print(line)
+            gef_print(line, buffer_name="regs_buffer")
 
-        gef_print(f"Flags: {gef.arch.flag_register_to_human()}")
+        gef_print(f"Flags: {gef.arch.flag_register_to_human()}", buffer_name="regs_buffer")
         return
 
     def context_stack(self) -> None:
@@ -7433,7 +7471,7 @@ class ContextCommand(GenericCommand):
             sp = gef.arch.sp
             if show_raw is True:
                 mem = gef.memory.read(sp, 0x10 * nb_lines)
-                gef_print(hexdump(mem, base=sp))
+                gef_print(hexdump(mem, base=sp), buffer_name="regs_buffer")
             else:
                 gdb.execute(f"dereference -l {nb_lines:d} {sp:#x}")
 
@@ -11028,8 +11066,10 @@ class GefUiManager(GefManager):
     """Class managing UI settings."""
     def __init__(self) -> None:
         self.redirect_fd : Optional[TextIOWrapper] = None
+        self.regs_redirect_fd : Optional[TextIOWrapper] = None
         self.context_hidden = False
         self.stream_buffer : Optional[StringIO] = None
+        self.regs_stream_buffer : Optional[StringIO] = None
         self.highlight_table: Dict[str, str] = {}
         self.watches: Dict[int, Tuple[int, str]] = {}
         self.context_messages: List[Tuple[str, str]] = []
