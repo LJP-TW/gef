@@ -15,6 +15,11 @@ development. Application developers will also benefit from it, as GEF lifts a gr
 GDB obscurity, avoiding repeating traditional commands, or bringing out the relevant information
 from the debugging runtime.
 
+## What's New?
+* `gef config context.regs_redirect <tty>`
+  * Redirect context.regs to another tty
+    ![](https://github.com/LJP-TW/gef/assets/26863912/2f29983a-9219-431d-a5c5-058d8f1d3465)
+
 ## Instant Setup
 
 Simply make sure you have [GDB 8.0 or higher](https://www.gnu.org/s/gdb) compiled with Python3.6+
